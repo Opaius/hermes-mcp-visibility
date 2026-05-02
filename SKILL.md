@@ -1,37 +1,32 @@
 ---
 name: mcp-visibility
-description: "Real MCP tool names on Discord — auto-discovers lazy-mcp tools and registers them as native Hermes tools with clean names."
-version: 1.0.0
+description: MCP optimization plugin for Hermes Agent + OpenCode — smart formatting, security guardrails, schema compaction, result caching.
+version: 2.0.0
 author: cioky
-license: MIT
-metadata:
-  hermes:
-    tags: [mcp, lazy-mcp, discord, tools, visibility, devops]
-    homepage: https://github.com/cioky/hermes-mcp-visibility
 ---
 
-# mcp-visibility
+# mcp-visibility v2
 
-Replaces generic `mcp_lazy_mcp_execute_tool` with real tool names on Discord.
+Dual plugin: Hermes Agent + OpenCode. Same pipeline, two transports.
 
-After install, instead of seeing N identical tool bubbles, you see:
-- ⚡ `ctx_execute`
-- 🔍 `web_search`
-- 🔎 `ctx_search`
-- 📊 `ctx_stats`
+**Installed at:** `~/.hermes/plugins/mcp-visibility/` (Hermes) and `~/.config/opencode/plugins/mcp-visibility.ts` (OpenCode)
 
-## Quick Install
+## Features
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/cioky/hermes-mcp-visibility/main/install.sh | bash
-hermes gateway restart
-```
+- **Smart formatting:** JSON→markdown table, YAML, HTML strip, text truncation
+- **Security:** hardline/approval/evasion patterns (Hermes only)
+- **Schema compaction:** ≤140 char descriptions (Hermes only)
+- **Result caching:** file-based, TTL-aware
+- **TOON fallback:** via `MCP_VISIBILITY_FMT=toon`
 
-## How it works
+## Key files
 
-Scans `lazy-mcp/hierarchy-hermes/` directory, discovers all MCP tools, and registers each as a Hermes tool with the tool's real name. The underlying MCP call still goes through the lazy-mcp proxy — only the DISPLAYED name changes.
+- `security.py` — unified security module
+- `output_fmt.py` — smart formatting engine
+- `opencode-plugin.ts` — OpenCode plugin (formatting + cache)
 
-## Requirements
+## Pitfalls
 
-- Hermes Agent with lazy-mcp MCP server configured
-- Tool needs to be in Hermes tools directory
+- Gateway restart needed after plugin code change
+- `MCP_VISIBILITY_SECURITY=0` disables ALL security (Hermes)
+- OpenCode uses native permissions — plugin security stripped

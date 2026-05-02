@@ -1,76 +1,114 @@
 # hermes-mcp-visibility
 
-Hermes Agent plugin for MCP tool optimization. Hooks-only architecture — works **with or without** context-mode MCP server.
+MCP tool optimization plugin — **Hermes Agent** + **OpenCode** support. Single codebase, two plugins, same pipeline.
 
 ## What it does
 
-| Feature | Effect | Env toggle |
-|---------|--------|------------|
-| **Security guardrail** | Blocks dangerous shell commands in `ctx_execute` | `MCP_VISIBILITY_SECURITY=1` |
-| **Schema compaction** | Truncates MCP tool descriptions (≤140 chars) | `MCP_VISIBILITY_SCHEMA_COMPACT=1` |
-| **TOON conversion** | JSON→compact format (40-60% token savings) | `MCP_VISIBILITY_TOON=1` |
-| **Result caching** | Deduplicates identical tool calls | `MCP_VISIBILITY_CACHE=1` |
+| Feature | Hermes | OpenCode | Description |
+|---------|:---:|:---:|-------------|
+| **Security guardrail** | ✓ | ✗¹ | Blocks dangerous shell commands, evasion detection, audit logging |
+| **Smart formatting** | ✓ | ✓ | JSON→md-table, YAML, HTML strip, text truncation with `[vis fmt=...]` headers |
+| **Schema compaction** | ✓ | ✗² | Truncates MCP tool descriptions ≤140 chars before LLM sees them |
+| **Result caching** | ✓ | ✓ | Deduplicates identical tool calls (file-based, TTL-aware) |
+| **TOON fallback** | ✓ | ✓ | Legacy compact format via `MCP_VISIBILITY_FMT=toon` |
 
-All features default ON. Disable any with env var `=0`.
+¹ OpenCode has built-in permission system — no need for plugin security.  
+² OpenCode MCP tools already have compact descriptions.
 
 ## Architecture
 
-**Hooks-only** — no wrapper tools registered. Modifies native MCP tools in-place:
+```
+Hermes Agent                     OpenCode
+    │                                │
+    ├─ pre_tool_call hook            ├─ tool.execute.before
+    │  └─ security check (shell)     │  └─ cache check
+    ├─ pre_llm_call hook (one-shot)  │
+    │  ├─ compact tool descriptions  │
+    │  └─ wrap handlers (security+fmt)│
+    └─ post_tool_call hook           └─ tool.execute.after
+       └─ format + cache                └─ format + cache
+```
 
-- `pre_tool_call` hook → security check on shell commands
-- `pre_llm_call` hook (one-shot) → compact tool descriptions + wrap handlers
-- `post_tool_call` hook → TOON conversion + caching
-
-Works with direct MCP servers (`bunx -y context-mode`), lazy-mcp proxy, or no MCP at all. Gracefully skips missing tools.
+**Shared modules:**
+- `security.py` — unified security (hardline/approval/evasion patterns, audit logging)
+- `output_fmt.py` — smart formatting (md-table, YAML, truncation, HTML strip)
+- `mcp_visibility.py` — core: TOON, cache, discovery, schema compaction
 
 ## Install
 
+### Hermes Agent
+
 ```bash
-# Clone
 git clone https://github.com/Opaius/hermes-mcp-visibility.git
-cd hermes-mcp-visibility
-
-# Copy plugin
 mkdir -p ~/.hermes/plugins/mcp-visibility
-cp __init__.py mcp_visibility.py plugin.yaml ~/.hermes/plugins/mcp-visibility/
-
-# Enable in config.yaml
-# plugins:
-#   enabled:
-#     - mcp-visibility
-
-# Restart gateway
+cp hermes-mcp-visibility/{__init__.py,mcp_visibility.py,security.py,output_fmt.py,plugin.yaml} ~/.hermes/plugins/mcp-visibility/
 hermes gateway restart
 ```
 
-Or use the install script:
+Or: `bash install.sh`
+
+### OpenCode
+
 ```bash
-bash install.sh
+git clone https://github.com/Opaius/hermes-mcp-visibility.git
+cp hermes-mcp-visibility/opencode-plugin.ts ~/.config/opencode/plugins/mcp-visibility.ts
 ```
 
-## Standalone (no MCP)
+Already in config? Just update the file. OpenCode picks it up on next run.
 
-Plugin works without any MCP server. Security, caching, and TOON features activate for any `mcp_*` tool calls. Schema compaction silently skips unregistered tools.
+## Configuration
 
-## With context-mode
+### Env vars (both plugins)
 
-When context-mode is configured as MCP server, plugin additionally:
-- Compacts verbose tool descriptions before LLM sees them
-- Wraps `ctx_execute`/`ctx_batch_execute` handlers with approval-aware security
-- Caches and converts results from all MCP tools
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_VISIBILITY_SECURITY` | `1` | Security checks (Hermes only) |
+| `MCP_VISIBILITY_CACHE` | `1` | Result caching |
+| `MCP_VISIBILITY_FMT` | `smart` | Format mode: `smart` \| `toon` \| `passthrough` |
+| `MCP_VISIBILITY_TOON` | `1` | Legacy TOON toggle (overridden by `FMT`) |
+| `MCP_VISIBILITY_SCHEMA_COMPACT` | `1` | Schema compaction (Hermes only) |
+
+Set in `~/.hermes/.env` for Hermes, or process env for OpenCode.
+
+### Smart formatting modes
+
+```
+smart (default)    md-table for arrays ≤8 cols, YAML for dicts, truncate long text
+toon              Legacy compact format
+passthrough       Raw output, no formatting
+```
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `__init__.py` | Plugin entry — `register(ctx)`, hooks, schema maps |
-| `mcp_visibility.py` | Core: security, caching, TOON, compaction, discovery |
+| `__init__.py` | Hermes plugin entry — `register(ctx)`, hooks, schema maps |
+| `mcp_visibility.py` | Core: TOON, caching, discovery, schema compaction |
+| `security.py` | Unified security module (hardline/approval/evasion, audit) |
+| `output_fmt.py` | Smart formatting (md-table, YAML, truncation, HTML strip) |
+| `opencode-plugin.ts` | OpenCode plugin (formatting + cache only) |
 | `plugin.yaml` | Hermes plugin manifest |
-| `install.sh` | One-line installer |
+| `install.sh` | One-line installer for Hermes |
+| `test_security.py` | 32 security tests |
+| `test_output_fmt.py` | 14 formatting tests |
+
+## Verifying
+
+```bash
+# Hermes: check logs
+grep "mcp-visibility" ~/.hermes/logs/agent.log | tail -5
+
+# OpenCode: run a quick test
+opencode run "echo test" --dangerously-skip-permissions
+
+# Run tests
+cd hermes-mcp-visibility
+python3 test_security.py    # 32 tests
+python3 test_output_fmt.py  # 14 tests
+```
 
 ## Requirements
 
 - Hermes Agent with plugin support
-- Python 3.10+
-- Optional: `pyyaml` (for config.yaml discovery)
-- Optional: `tools.approval` (Hermes built-in, for security checks)
+- Python 3.10+ (PyYAML optional)
+- Bun (OpenCode plugin)
