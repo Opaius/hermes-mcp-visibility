@@ -1,103 +1,76 @@
 # hermes-mcp-visibility
 
-Real MCP tool names on Discord for Hermes Agent.
+Hermes Agent plugin for MCP tool optimization. Hooks-only architecture — works **with or without** context-mode MCP server.
 
-**Problem:** When using lazy-mcp proxy, Discord shows `mcp_lazy_mcp_execute_tool` repeated for every MCP call. You can't tell which tool is being used.
+## What it does
 
-**Solution:** This plugin auto-discovers all MCP tools from the lazy-mcp proxy and registers them as native Hermes tools with their real names. After install, Discord shows:
+| Feature | Effect | Env toggle |
+|---------|--------|------------|
+| **Security guardrail** | Blocks dangerous shell commands in `ctx_execute` | `MCP_VISIBILITY_SECURITY=1` |
+| **Schema compaction** | Truncates MCP tool descriptions (≤140 chars) | `MCP_VISIBILITY_SCHEMA_COMPACT=1` |
+| **TOON conversion** | JSON→compact format (40-60% token savings) | `MCP_VISIBILITY_TOON=1` |
+| **Result caching** | Deduplicates identical tool calls | `MCP_VISIBILITY_CACHE=1` |
 
-| Before | After |
-|--------|-------|
-| ⚙️ mcp_lazy_mcp_execute_tool | ⚡ ctx_execute |
-| ⚙️ mcp_lazy_mcp_execute_tool | 🔍 web_search |
-| ⚙️ mcp_lazy_mcp_execute_tool | 🔎 ctx_search |
-| ⚙️ mcp_lazy_mcp_execute_tool | 📊 ctx_stats |
-| ⚙️ mcp_lazy_mcp_execute_tool | 📥 ctx_fetch |
+All features default ON. Disable any with env var `=0`.
 
-## Features
+## Architecture
 
-- **Dynamic discovery** — scans lazy-mcp hierarchy, registers every tool found
-- **Clean names** — `ctx_execute`, `web_search`, `ctx_fetch`, not `context_mode_ctx_execute`
-- **Auto-updating** — add a new MCP server → restart Hermes → tools appear
-- **Zero config** — just drop the file in, no YAML editing
-- **Tool aliases** — well-known tools get short, memorable names
+**Hooks-only** — no wrapper tools registered. Modifies native MCP tools in-place:
+
+- `pre_tool_call` hook → security check on shell commands
+- `pre_llm_call` hook (one-shot) → compact tool descriptions + wrap handlers
+- `post_tool_call` hook → TOON conversion + caching
+
+Works with direct MCP servers (`bunx -y context-mode`), lazy-mcp proxy, or no MCP at all. Gracefully skips missing tools.
 
 ## Install
 
 ```bash
-# One-liner
-curl -fsSL https://raw.githubusercontent.com/cioky/hermes-mcp-visibility/main/install.sh | bash
+# Clone
+git clone https://github.com/Opaius/hermes-mcp-visibility.git
+cd hermes-mcp-visibility
 
-# Or manually
-cp mcp_visibility.py ~/.hermes/hermes-agent/tools/
+# Copy plugin
+mkdir -p ~/.hermes/plugins/mcp-visibility
+cp __init__.py mcp_visibility.py plugin.yaml ~/.hermes/plugins/mcp-visibility/
+
+# Enable in config.yaml
+# plugins:
+#   enabled:
+#     - mcp-visibility
+
+# Restart gateway
 hermes gateway restart
 ```
 
-## Registered tools (13 discovered)
+Or use the install script:
+```bash
+bash install.sh
+```
 
-```
-ctx_execute      ← context-mode.ctx_execute      ⚡
-ctx_search       ← context-mode.ctx_search       🔎
-ctx_index        ← context-mode.ctx_index        📚
-ctx_fetch        ← context-mode.ctx_fetch_and_index 📥
-ctx_batch        ← context-mode.ctx_batch_execute
-ctx_stats        ← context-mode.ctx_stats        📊
-ctx_doctor       ← context-mode.ctx_doctor       🏥
-ctx_upgrade      ← context-mode.ctx_upgrade
-ctx_purge        ← context-mode.ctx_purge
-ctx_insight      ← context-mode.ctx_insight
-ctx_exec_file    ← context-mode.ctx_execute_file
-web_search       ← searxng.search                🔍
-web_read         ← searxng.web_url_read          📖
-```
+## Standalone (no MCP)
+
+Plugin works without any MCP server. Security, caching, and TOON features activate for any `mcp_*` tool calls. Schema compaction silently skips unregistered tools.
+
+## With context-mode
+
+When context-mode is configured as MCP server, plugin additionally:
+- Compacts verbose tool descriptions before LLM sees them
+- Wraps `ctx_execute`/`ctx_batch_execute` handlers with approval-aware security
+- Caches and converts results from all MCP tools
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `__init__.py` | Plugin entry — `register(ctx)`, hooks, schema maps |
+| `mcp_visibility.py` | Core: security, caching, TOON, compaction, discovery |
+| `plugin.yaml` | Hermes plugin manifest |
+| `install.sh` | One-line installer |
 
 ## Requirements
 
-- Hermes Agent (any recent version)
-- [lazy-mcp](https://github.com/cioky/lazy-mcp) proxy configured in `~/.hermes/config.yaml`
+- Hermes Agent with plugin support
 - Python 3.10+
-
-## Configuration
-
-Zero config needed. The plugin auto-detects the hierarchy path from:
-1. `MCP_VISIBILITY_HIERARCHY` env var
-2. `~/hermes-agency/lazy-mcp/hierarchy-hermes`
-
-To add custom tool aliases, edit the `TOOL_ALIASES` dict in `mcp_visibility.py`.
-
-## How it works
-
-```
-lazy-mcp proxy
-    ↓
-hierarchy-hermes/
-    context-mode/
-        ctx_execute.json  →  {maps_to: "ctx_execute", inputSchema: {...}}
-        ctx_search.json   →  {maps_to: "ctx_search", ...}
-    searxng/
-        search.json       →  {maps_to: "search", ...}
-    ↓
-mcp_visibility.py (this plugin)
-    ↓  auto-discovers all tools
-    ↓  registers as Hermes tools with clean names
-    ↓
-Hermes Agent
-    ↓  shows tool names on Discord
-⚡ ctx_execute   🔍 web_search   🔎 ctx_search
-```
-
-## Uninstall
-
-```bash
-rm ~/.hermes/hermes-agent/tools/mcp_visibility.py
-# or: rm /usr/local/lib/hermes-agent/tools/mcp_visibility.py
-hermes gateway restart
-```
-
-## License
-
-MIT — do whatever you want.
-
----
-
-Part of the [hermes-ctx-enhance](https://github.com/Opaius/hermes-ctx-enhance) ecosystem.
+- Optional: `pyyaml` (for config.yaml discovery)
+- Optional: `tools.approval` (Hermes built-in, for security checks)
