@@ -10,17 +10,17 @@ tool: ctx_execute, web_search, ctx_search, etc.
 Dynamic: add MCP servers → restart Hermes → tools appear.
 No config. No code changes. Just drop the file in tools/.
 
-Install:
+Install (standalone drop-in):
   cp mcp_visibility.py ~/.hermes/hermes-agent/tools/
-  # or: hermes plugins install https://github.com/cioky/hermes-mcp-visibility
+
+Install (proper plugin):
+  hermes plugins install https://github.com/cioky/hermes-mcp-visibility
 """
 import json, logging, os, re
 from pathlib import Path
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
-
-from tools.registry import registry
 
 # Path to lazy-mcp hierarchy (auto-detected or set via env)
 LAZY_MCP_HIERARCHY = os.path.expanduser(
@@ -81,7 +81,7 @@ def _load_hierarchy_tools() -> Dict[str, Dict[str, Any]]:
                     "desc": tdef.get("description", ""),
                 }
     
-    logger.info("mcp-visibility: found %d tools", len(tools))
+    logger.info("mcp-visibility: found %d tools from %s", len(tools), LAZY_MCP_HIERARCHY)
     return tools
 
 
@@ -103,54 +103,72 @@ def _safe_name(s: str) -> str:
     return re.sub(r'[^a-zA-Z0-9_-]', '_', s).strip('_') or "mcp"
 
 
-# ── Registration ────────────────────────────────────────
+# ── Standalone drop-in mode (when NOT used as a plugin) ──────────────────────
+# Only runs when this file is imported directly by tools/ auto-discovery.
+# When used as a proper plugin, __init__.py calls register() via ctx.register_tool().
 
-tools = _load_hierarchy_tools()
+def register_standalone():
+    """Register all discovered tools using tools.registry (drop-in mode)."""
+    from tools.registry import registry
 
-for canonical, info in sorted(tools.items()):
-    # Prefer alias, fall back to canonical
-    display = TOOL_ALIASES.get(canonical)
-    if not display:
-        # Auto-generate: strip ctx_ prefix for context-mode, keep short
-        parts = canonical.split(".")
-        if len(parts) == 2 and parts[1].startswith("ctx_"):
-            display = parts[1]  # ctx_execute, ctx_search, etc.
-        else:
-            display = _safe_name(parts[-1] if len(parts) > 1 else canonical)
-    
-    emoji = TOOL_EMOJIS.get(display, "🔌")
-    server = info["server"]
-    tool = info["tool"]
-    schema = info["schema"] or {"type": "object", "properties": {}}
-    desc = info["desc"] or f"MCP: {canonical}"
+    tools = _load_hierarchy_tools()
+    if not tools:
+        return 0
 
-    # Build schema with info about the underlying tool
-    tool_schema = {
-        "name": display,
-        "description": f"[{canonical}] {desc[:300]}",
-        "parameters": schema if schema.get("properties") else {
-            "type": "object",
-            "properties": {
-                "arguments": {"type": "object", "description": f"Args for {canonical}"}
+    for canonical, info in sorted(tools.items()):
+        # Prefer alias, fall back to canonical
+        display = TOOL_ALIASES.get(canonical)
+        if not display:
+            parts = canonical.split(".")
+            if len(parts) == 2 and parts[1].startswith("ctx_"):
+                display = parts[1]
+            else:
+                display = _safe_name(parts[-1] if len(parts) > 1 else canonical)
+        
+        emoji = TOOL_EMOJIS.get(display, "🔌")
+        server = info["server"]
+        tool = info["tool"]
+        schema = info["schema"] or {"type": "object", "properties": {}}
+        desc = info["desc"] or f"MCP: {canonical}"
+
+        tool_schema = {
+            "name": display,
+            "description": f"[{canonical}] {desc[:300]}",
+            "parameters": schema if schema.get("properties") else {
+                "type": "object",
+                "properties": {
+                    "arguments": {"type": "object", "description": f"Args for {canonical}"}
+                }
             }
         }
-    }
 
-    # Closure to capture server/tool
-    def _handler(srv=server, tl=tool):
-        def h(args, **kw):
-            return _call_mcp(srv, tl, args)
-        return h
+        # Closure to capture server/tool
+        def _handler(srv=server, tl=tool):
+            def h(args, **kw):
+                return _call_mcp(srv, tl, args)
+            return h
 
+        try:
+            registry.register(
+                name=display,
+                toolset="hermes-cli",
+                schema=tool_schema,
+                handler=_handler(),
+                emoji=emoji,
+            )
+        except Exception as e:
+            logger.warning("mcp-visibility: skip %s: %s", display, e)
+
+    logger.info("mcp-visibility (standalone): registered %d tools", len(tools))
+    return len(tools)
+
+
+# Auto-register when imported directly (standalone drop-in mode)
+_imported_as = __name__
+if _imported_as == "__main__" or _imported_as.endswith(".mcp_visibility"):
     try:
-        registry.register(
-            name=display,
-            toolset="hermes-cli",
-            schema=tool_schema,
-            handler=_handler(),
-            emoji=emoji,
-        )
-    except Exception as e:
-        logger.warning("mcp-visibility: skip %s: %s", display, e)
-
-logger.info("mcp-visibility: registered %d tools", len(tools))
+        # Only register if tools.registry is available (Hermes runtime)
+        import tools.registry  # noqa: F401
+        count = register_standalone()
+    except ImportError:
+        pass  # Not in Hermes runtime, probably being linted/imported elsewhere
