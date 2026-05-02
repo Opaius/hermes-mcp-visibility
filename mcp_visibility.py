@@ -3,20 +3,18 @@
 mcp-visibility — Real MCP tool names on Discord for Hermes Agent
 
 Auto-discovers tools from lazy-mcp proxy and registers them as
-native Hermes tools with clean, short names. Instead of seeing
-'mcp_lazy_mcp_execute_tool' × N on Discord, you see the actual
-tool: ctx_execute, web_search, ctx_search, etc.
+native Hermes tools with clean, short names.
 
-Dynamic: add MCP servers → restart Hermes → tools appear.
-No config. No code changes. Just drop the file in tools/.
+Key features:
+- Dynamic discovery: scans lazy-mcp hierarchy, registers every tool found
+- Security-aware: pipes shell commands through Hermes approval system
+- Transport-agnostic: works with or without lazy-mcp proxy
+- Plugin-agnostic: provides pre_tool_call hook for bare MCP protection
 
-Install (standalone drop-in):
-  cp mcp_visibility.py ~/.hermes/hermes-agent/tools/
-
-Install (proper plugin):
+Install:
   hermes plugins install https://github.com/cioky/hermes-mcp-visibility
 """
-import json, logging, os, re
+import json, logging, os, re, subprocess, tempfile
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -29,7 +27,6 @@ LAZY_MCP_HIERARCHY = os.path.expanduser(
 )
 
 # Short preferred names for well-known MCP tools
-# Format: "server.tool" → "display_name"
 TOOL_ALIASES = {
     "context-mode.ctx_execute": "ctx_execute",
     "context-mode.ctx_search": "ctx_search",
@@ -52,6 +49,9 @@ TOOL_EMOJIS = {
     "ctx_fetch": "📥", "ctx_stats": "📊", "ctx_doctor": "🏥",
     "web_search": "🔍", "web_read": "📖",
 }
+
+# Tools whose shell commands need security checks
+SHELL_EXEC_TOOLS = {"context-mode.ctx_execute", "context-mode.ctx_batch_execute"}
 
 
 def _load_hierarchy_tools() -> Dict[str, Dict[str, Any]]:
@@ -85,27 +85,163 @@ def _load_hierarchy_tools() -> Dict[str, Dict[str, Any]]:
     return tools
 
 
-def _call_mcp(server: str, tool: str, args: Dict[str, Any]) -> str:
-    """Route through lazy-mcp proxy."""
-    from model_tools import handle_function_call
-    result = handle_function_call("mcp_lazy_mcp_execute_tool", {
-        "tool_path": f"{server}.{tool}",
-        "arguments": args,
-    })
-    if isinstance(result, str):
-        return result
-    if isinstance(result, dict):
-        return result.get("content", result.get("result", json.dumps(result)))
-    return str(result)
+def _check_command_security(shell_code: str) -> Optional[str]:
+    """
+    Run Hermes security checks on a shell command.
+    Returns None if safe, or an error message string if blocked.
+    
+    Uses Hermes' built-in dangerous command detection + tirith.
+    Falls back gracefully if Hermes runtime isn't available.
+    """
+    try:
+        from tools.approval import check_all_command_guards
+        result = check_all_command_guards(shell_code, "local")
+        if not result.get("approved"):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": result.get("message", "Command blocked by security policy"),
+                "status": result.get("status", "blocked"),
+            }, ensure_ascii=False)
+        return None  # Approved
+    except ImportError:
+        # Hermes runtime not available — skip security (standalone/testing)
+        logger.debug("mcp-visibility: Hermes approval module not available, skipping security")
+        return None
+    except Exception as e:
+        logger.warning("mcp-visibility: security check failed: %s", e)
+        # Fail open in standalone mode, but block with message if possible
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"Security check error: {e}",
+            "status": "blocked",
+        }, ensure_ascii=False)
+
+
+def _execute_direct(shell_code: str, timeout: int = 30) -> str:
+    """
+    Execute a shell command directly (without lazy-mcp proxy).
+    Used as fallback when lazy-mcp is unavailable.
+    Still runs security checks first.
+    """
+    # Security check
+    block = _check_command_security(shell_code)
+    if block:
+        return block
+
+    try:
+        result = subprocess.run(
+            ["bash", "-c", shell_code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=os.getcwd(),
+        )
+        output = result.stdout
+        if result.stderr:
+            output += "\n" + result.stderr
+        return json.dumps({
+            "output": output,
+            "exit_code": result.returncode,
+        }, ensure_ascii=False)
+    except subprocess.TimeoutExpired:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"Command timed out after {timeout}s",
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": str(e),
+        }, ensure_ascii=False)
+
+
+def _call_mcp(server: str, tool: str, args: Dict[str, Any],
+              use_proxy: bool = True) -> str:
+    """
+    Route a tool call with security checks.
+    
+    With lazy-mcp proxy: check security → route through proxy.
+    Without lazy-mcp proxy: check security → execute directly.
+    """
+    canonical = f"{server}.{tool}"
+
+    # Security check for shell execution tools
+    if canonical in SHELL_EXEC_TOOLS:
+        language = args.get("language", "")
+        code = args.get("code", "")
+        if language == "shell" and code:
+            block_msg = _check_command_security(code)
+            if block_msg:
+                return block_msg
+
+    if use_proxy:
+        try:
+            from model_tools import handle_function_call
+            result = handle_function_call("mcp_lazy_mcp_execute_tool", {
+                "tool_path": canonical,
+                "arguments": args,
+            })
+            if isinstance(result, str):
+                return result
+            if isinstance(result, dict):
+                return result.get("content", result.get("result", json.dumps(result)))
+            return str(result)
+        except ImportError:
+            logger.debug("mcp-visibility: lazy-mcp proxy unavailable, falling back to direct")
+            use_proxy = False
+
+    # Direct execution fallback
+    if canonical in SHELL_EXEC_TOOLS:
+        return _execute_direct(args.get("code", ""),
+                              timeout=args.get("timeout", 30000) // 1000)
+
+    return json.dumps({
+        "output": "",
+        "exit_code": -1,
+        "error": f"Tool {canonical} requires lazy-mcp proxy or direct handler",
+    }, ensure_ascii=False)
 
 
 def _safe_name(s: str) -> str:
     return re.sub(r'[^a-zA-Z0-9_-]', '_', s).strip('_') or "mcp"
 
 
-# ── Standalone drop-in mode (when NOT used as a plugin) ──────────────────────
-# Only runs when this file is imported directly by tools/ auto-discovery.
-# When used as a proper plugin, __init__.py calls register() via ctx.register_tool().
+# ── pre_tool_call hook for bare mcp_lazy_mcp_execute_tool ──────────────────
+
+def pre_tool_call_security(tool_name: str, tool_args: dict, **kwargs) -> Optional[dict]:
+    """
+    pre_tool_call hook that adds security checks to bare MCP calls.
+    
+    When mcp-visibility plugin ISN'T installed but someone uses
+    mcp_lazy_mcp_execute_tool directly, this hook catches shell commands
+    and runs security checks.
+    
+    Returns None to allow the call, or a dict with 'block' key to stop it.
+    """
+    if tool_name != "mcp_lazy_mcp_execute_tool":
+        return None
+
+    tool_path = tool_args.get("tool_path", "")
+    if tool_path not in SHELL_EXEC_TOOLS:
+        return None
+
+    arguments = tool_args.get("arguments", {})
+    language = arguments.get("language", "")
+    code = arguments.get("code", "")
+
+    if language == "shell" and code:
+        block_msg = _check_command_security(code)
+        if block_msg:
+            return {"block": True, "reason": block_msg}
+
+    return None
+
+
+# ── Registration ────────────────────────────────────────
 
 def register_standalone():
     """Register all discovered tools using tools.registry (drop-in mode)."""
@@ -116,7 +252,6 @@ def register_standalone():
         return 0
 
     for canonical, info in sorted(tools.items()):
-        # Prefer alias, fall back to canonical
         display = TOOL_ALIASES.get(canonical)
         if not display:
             parts = canonical.split(".")
@@ -142,7 +277,6 @@ def register_standalone():
             }
         }
 
-        # Closure to capture server/tool
         def _handler(srv=server, tl=tool):
             def h(args, **kw):
                 return _call_mcp(srv, tl, args)
@@ -167,8 +301,7 @@ def register_standalone():
 _imported_as = __name__
 if _imported_as == "__main__" or _imported_as.endswith(".mcp_visibility"):
     try:
-        # Only register if tools.registry is available (Hermes runtime)
         import tools.registry  # noqa: F401
         count = register_standalone()
     except ImportError:
-        pass  # Not in Hermes runtime, probably being linted/imported elsewhere
+        pass

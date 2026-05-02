@@ -1,19 +1,7 @@
 """
 mcp-visibility — Real MCP tool names on Discord for Hermes Agent.
 
-Auto-discovers all MCP tools from the lazy-mcp proxy and registers them
-as native Hermes tools with clean, short names. Instead of seeing
-'mcp_lazy_mcp_execute_tool' × N on Discord, users see actual tool names:
-ctx_execute, web_search, ctx_search, etc.
-
-Agnostic by design: add a new MCP server → restart Hermes → tools appear.
-No config. No hardcoded server list.
-
-Install:
-  hermes plugins install https://github.com/cioky/hermes-mcp-visibility
-  # or manually:
-  git clone https://github.com/cioky/hermes-mcp-visibility \
-    ~/.hermes/plugins/mcp-visibility/
+Security-aware, transport-agnostic MCP tool wrapper.
 """
 
 from __future__ import annotations
@@ -22,31 +10,32 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Import core discovery logic from sibling module
 from .mcp_visibility import (
     _load_hierarchy_tools,
     _call_mcp,
+    _check_command_security,
+    _execute_direct,
+    SHELL_EXEC_TOOLS,
     TOOL_ALIASES,
     TOOL_EMOJIS,
     _safe_name,
+    pre_tool_call_security,
 )
 
 
 def register(ctx) -> None:
-    """Register all discovered MCP tools. Called once by plugin loader."""
+    """Register all discovered MCP tools with security + transport agnosticism."""
     tools = _load_hierarchy_tools()
     if not tools:
         logger.warning("mcp-visibility: no MCP tools found in hierarchy")
         return
 
     for canonical, info in sorted(tools.items()):
-        # Prefer alias, fall back to canonical
         display = TOOL_ALIASES.get(canonical)
         if not display:
-            # Auto-generate: strip ctx_ prefix for context-mode, keep short
             parts = canonical.split(".")
             if len(parts) == 2 and parts[1].startswith("ctx_"):
-                display = parts[1]  # ctx_execute, ctx_search, etc.
+                display = parts[1]
             else:
                 display = _safe_name(parts[-1] if len(parts) > 1 else canonical)
 
@@ -56,7 +45,6 @@ def register(ctx) -> None:
         schema = info["schema"] or {"type": "object", "properties": {}}
         desc = info["desc"] or f"MCP: {canonical}"
 
-        # Build schema with info about the underlying tool
         tool_schema = {
             "name": display,
             "description": f"[{canonical}] {desc[:300]}",
@@ -68,7 +56,7 @@ def register(ctx) -> None:
             }
         }
 
-        # Create handler closure capturing server/tool
+        # Handler with security checks built-in
         def _make_handler(srv, tl):
             def handler(args, **kw):
                 return _call_mcp(srv, tl, args)
@@ -84,5 +72,14 @@ def register(ctx) -> None:
             )
         except Exception as e:
             logger.warning("mcp-visibility: skip %s: %s", display, e)
+
+    # Register pre_tool_call hook for bare MCP protection
+    # This catches mcp_lazy_mcp_execute_tool calls when the wrapper tools
+    # aren't being used, and still applies security checks.
+    try:
+        ctx.register_hook("pre_tool_call", pre_tool_call_security)
+        logger.info("mcp-visibility: registered pre_tool_call security hook")
+    except Exception as e:
+        logger.debug("mcp-visibility: pre_tool_call hook registration skipped: %s", e)
 
     logger.info("mcp-visibility: registered %d tools", len(tools))
