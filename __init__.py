@@ -200,7 +200,18 @@ def _compact_native_tool_schemas(**kwargs) -> None:
 
                     # Post-execution: smart formatting + cache
                     if _fmt:
-                        result = _fmt(str(result), tool_name)
+                        result_str = str(result)
+                        try:
+                            parsed = json.loads(result_str)
+                            if isinstance(parsed, dict) and "result" in parsed and isinstance(parsed["result"], str):
+                                inner = parsed["result"]
+                                formatted_inner = _fmt(inner, tool_name)
+                                parsed["result"] = formatted_inner
+                                result = json.dumps(parsed, ensure_ascii=False)
+                            else:
+                                result = _fmt(result_str, tool_name)
+                        except Exception:
+                            result = _fmt(result_str, tool_name)
                     if _set:
                         _set(tool_name, args, str(result))
 
